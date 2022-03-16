@@ -43,7 +43,7 @@ class TrainOptions:
         self.parser.add_argument('--board_interval', default=50, type=int,
                                  help='Interval for logging metrics to tensorboard')
         self.parser.add_argument('--val_interval', default=1000, type=int, help='Validation interval')
-        self.parser.add_argument('--save_interval', default=None, type=int, help='Model checkpoint interval')
+        self.parser.add_argument('--save_interval', default=25, type=int, help='Model checkpoint interval')
 
         # Discriminator flags
         self.parser.add_argument('--w_discriminator_lambda', default=0, type=float, help='Dw loss multiplier')

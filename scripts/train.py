@@ -56,6 +56,8 @@ def setup_progressive_steps(opts):
 			opts.progressive_steps.append(next_progressive_step)
 			next_progressive_step += opts.progressive_step_every
 
+	print("YAKOV: "+str(opts.progressive_steps))
+
 	assert opts.progressive_steps is None or is_valid_progressive_steps(opts, num_style_layers), \
 		"Invalid progressive training input"
 
@@ -77,8 +79,8 @@ def create_initial_experiment_dir(opts):
 
 def update_new_configs(ckpt_opts, new_opts):
 	for k, v in new_opts.items():
-		if k not in ckpt_opts:
-			ckpt_opts[k] = v
+		#if k not in ckpt_opts:
+		ckpt_opts[k] = v
 	if new_opts['update_param_list']:
 		for param in new_opts['update_param_list']:
 			ckpt_opts[param] = new_opts[param]

@@ -18,12 +18,17 @@ class LatentEditor(object):
     def apply_interfacegan(self, latent, direction, factor=1, factor_range=None):
         edit_latents = []
         if factor_range is not None:  # Apply a range of editing factors. for example, (-5, 5)
+            print("ok2")
             for f in range(*factor_range):
                 edit_latent = latent + f * direction
                 edit_latents.append(edit_latent)
             edit_latents = torch.cat(edit_latents)
         else:
-            edit_latents = latent + factor * direction
+            print("ok1")
+            print(latent.shape, factor, direction.shape)
+            print("aaaa")
+            edit_latents = latent + (factor * direction)
+        print(f"OK: {len(edit_latents)}")
         return self._latents_to_image(edit_latents)
 
     def apply_sefa(self, latent, indices=[2, 3, 4, 5], **kwargs):

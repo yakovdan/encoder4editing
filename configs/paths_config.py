@@ -17,7 +17,11 @@ dataset_paths = {
 
 	#  Cats Dataset (In the paper: LSUN Cat)
 	'cats_train': '',
-	'cats_test': ''
+	'cats_test': '',
+	
+	#
+	'my_train_data': '/home/yakovdan/e4e_dataset',
+	'my_test_data': '/home/yakovdan/e4e_dataset/testset'
 }
 
 model_paths = {

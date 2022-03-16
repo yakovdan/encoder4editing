@@ -1,3 +1,9 @@
+import PIL
+from ibug.face_detection import RetinaFacePredictor
+from ibug.face_parsing import FaceParser as RTNetPredictor
+import dlib
+import numpy as np
+import cv2
 import os
 import random
 import matplotlib
@@ -10,6 +16,7 @@ from torch import nn, autograd
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
+from torchvision import models, transforms
 
 from utils import common, train_utils
 from criteria import id_loss, moco_loss
@@ -28,7 +35,9 @@ torch.manual_seed(0)
 
 class Coach:
     def __init__(self, opts, prev_train_checkpoint=None):
+        self.softmax = torch.nn.Softmax()
         self.opts = opts
+        self.opts.classifier_lambda = 0.2 
 
         self.global_step = 0
 
@@ -37,14 +46,21 @@ class Coach:
         # Initialize network
         self.net = pSp(self.opts).to(self.device)
 
+        self.detector = dlib.get_frontal_face_detector()
+        self.predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+        self.face_detector = RetinaFacePredictor(threshold=0.8, device="cuda",
+                                            model=(RetinaFacePredictor.get_model('mobilenet0.25')))
+        self.face_parser = RTNetPredictor(
+            device="cuda", ckpt=None, encoder="rtnet50", decoder="fcn", num_classes=11)
+
         # Initialize loss
         if self.opts.lpips_lambda > 0:
             self.lpips_loss = LPIPS(net_type=self.opts.lpips_type).to(self.device).eval()
         if self.opts.id_lambda > 0:
-            if 'ffhq' in self.opts.dataset_type or 'celeb' in self.opts.dataset_type:
-                self.id_loss = id_loss.IDLoss().to(self.device).eval()
-            else:
-                self.id_loss = moco_loss.MocoLoss(opts).to(self.device).eval()
+            #if 'ffhq' in self.opts.dataset_type or 'celeb' in self.opts.dataset_type:
+            self.id_loss = id_loss.IDLoss().to(self.device).eval()
+            #else:
+            #    self.id_loss = moco_loss.MocoLoss(opts).to(self.device).eval()
         self.mse_loss = nn.MSELoss().to(self.device).eval()
 
         # Initialize optimizer
@@ -87,17 +103,114 @@ class Coach:
             self.load_from_train_checkpoint(prev_train_checkpoint)
             prev_train_checkpoint = None
 
+        model_ft, input_size = self.initialize_model("resnet", 2, True, use_pretrained=True)
+        self.model_ft = model_ft
+        self.input_size = input_size
+        data_dict = torch.load("/home/yakovdan/best_classifier.pt")
+        self.model_ft.load_state_dict(data_dict['state_dict'])
+        self.model_ft = self.model_ft.cuda()
+        self.model_ft.eval()
+        self.classifier_transforms = transforms.Compose([transforms.Resize(self.input_size),
+                                                transforms.CenterCrop(self.input_size),
+                                                transforms.ToTensor(),
+                                                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+        self.classifier_transforms1 = transforms.Compose([transforms.Resize(self.input_size),
+                                                         transforms.CenterCrop(self.input_size),
+                                                         transforms.Normalize([0.485, 0.456, 0.406],
+                                                                              [0.229, 0.224, 0.225])])
+    def set_parameter_requires_grad(self, model, feature_extracting):
+        if feature_extracting:
+            for param in model.parameters():
+                param.requires_grad = False
+
+    def initialize_model(self, model_name, num_classes, feature_extract, use_pretrained=True):
+        # Initialize these variables which will be set in this if statement. Each of these
+        #   variables is model specific.
+        model_ft = None
+        input_size = 0
+
+        if model_name == "resnet":
+            """ Resnet18
+            """
+            model_ft = models.resnet18(pretrained=use_pretrained)
+            self.set_parameter_requires_grad(model_ft, feature_extract)
+            num_ftrs = model_ft.fc.in_features
+            model_ft.fc = nn.Linear(num_ftrs, num_classes)
+            input_size = 224
+
+        elif model_name == "alexnet":
+            """ Alexnet
+            """
+            model_ft = models.alexnet(pretrained=use_pretrained)
+            self.set_parameter_requires_grad(model_ft, feature_extract)
+            num_ftrs = model_ft.classifier[6].in_features
+            model_ft.classifier[6] = nn.Linear(num_ftrs, num_classes)
+            input_size = 224
+
+        elif model_name == "vgg":
+            """ VGG11_bn
+            """
+            model_ft = models.vgg11_bn(pretrained=use_pretrained)
+            self.set_parameter_requires_grad(model_ft, feature_extract)
+            num_ftrs = model_ft.classifier[6].in_features
+            model_ft.classifier[6] = nn.Linear(num_ftrs, num_classes)
+            input_size = 224
+
+        elif model_name == "squeezenet":
+            """ Squeezenet
+            """
+            model_ft = models.squeezenet1_0(pretrained=use_pretrained)
+            self.set_parameter_requires_grad(model_ft, feature_extract)
+            model_ft.classifier[1] = nn.Conv2d(512, num_classes, kernel_size=(1, 1), stride=(1, 1))
+            model_ft.num_classes = num_classes
+            input_size = 224
+
+        elif model_name == "densenet":
+            """ Densenet
+            """
+            model_ft = models.densenet121(pretrained=use_pretrained)
+            self.set_parameter_requires_grad(model_ft, feature_extract)
+            num_ftrs = model_ft.classifier.in_features
+            model_ft.classifier = nn.Linear(num_ftrs, num_classes)
+            input_size = 224
+
+        elif model_name == "inception":
+            """ Inception v3
+            Be careful, expects (299,299) sized images and has auxiliary output
+            """
+            model_ft = models.inception_v3(pretrained=use_pretrained)
+            self.set_parameter_requires_grad(model_ft, feature_extract)
+            # Handle the auxilary net
+            num_ftrs = model_ft.AuxLogits.fc.in_features
+            model_ft.AuxLogits.fc = nn.Linear(num_ftrs, num_classes)
+            # Handle the primary net
+            num_ftrs = model_ft.fc.in_features
+            model_ft.fc = nn.Linear(num_ftrs, num_classes)
+            input_size = 299
+
+        else:
+            print("Invalid model name, exiting...")
+            exit()
+
+        return model_ft, input_size
+
+    def classifier_loss(self, image):
+        transformed_image = self.classifier_transforms1(image)
+        logits_vec = self.model_ft(transformed_image)
+        s_max = self.softmax(logits_vec)
+        return torch.pow((1 - s_max[0][1]), 3)
+
     def load_from_train_checkpoint(self, ckpt):
         print('Loading previous training data...')
-        self.global_step = ckpt['global_step'] + 1
-        self.best_val_loss = ckpt['best_val_loss']
+        self.global_step = 0#ckpt['global_step'] + 1
+        self.best_val_loss = 100#ckpt['best_val_loss']
         self.net.load_state_dict(ckpt['state_dict'])
 
         if self.opts.keep_optimizer:
             self.optimizer.load_state_dict(ckpt['optimizer'])
         if self.opts.w_discriminator_lambda > 0:
-            self.discriminator.load_state_dict(ckpt['discriminator_state_dict'])
-            self.discriminator_optimizer.load_state_dict(ckpt['discriminator_optimizer_state_dict'])
+            self.discriminator.load_state_dict(torch.load('/home/yakovdan/encoder4editing/pretrained_models/ffhq_discriminator_ckpt.pt'))
+            #self.discriminator_optimizer.load_state_dict(ckpt['discriminator_optimizer_state_dict'])
         if self.opts.progressive_steps:
             self.check_for_progressive_training_update(is_resume_from_ckpt=True)
         print(f'Resuming training from step {self.global_step}')
@@ -260,19 +373,24 @@ class Coach:
             loss_dict['total_delta_loss'] = float(total_delta_loss)
             loss += self.opts.delta_norm_lambda * total_delta_loss
 
-        if self.opts.id_lambda > 0:  # Similarity loss
-            loss_id, sim_improvement, id_logs = self.id_loss(y_hat, y, x)
+        if self.opts.id_lambda > 0:  # Similarity loss # MODIFY THIS
+            loss_id, sim_improvement, id_logs = self.id_loss(self.mask_eyes(y_hat), self.mask_eyes(y), self.mask_eyes(x))
             loss_dict['loss_id'] = float(loss_id)
             loss_dict['id_improve'] = float(sim_improvement)
             loss += loss_id * self.opts.id_lambda
-        if self.opts.l2_lambda > 0:
-            loss_l2 = F.mse_loss(y_hat, y)
+        if self.opts.l2_lambda > 0: # THIS
+            loss_l2 = F.mse_loss(self.mask_eyes(y_hat), self.mask_eyes(y))
             loss_dict['loss_l2'] = float(loss_l2)
-            loss += loss_l2 * self.opts.l2_lambda
+            loss += loss_l2 * self.opts.l2_lambda * 2
         if self.opts.lpips_lambda > 0:
             loss_lpips = self.lpips_loss(y_hat, y)
             loss_dict['loss_lpips'] = float(loss_lpips)
             loss += loss_lpips * self.opts.lpips_lambda
+        if self.opts.classifier_lambda > 0:
+            #print("Y_hat type: "+str(type(y_hat)))
+            classifier_loss = self.classifier_loss(y_hat)
+            loss_dict['loss_classifier'] = float(classifier_loss)
+            loss += classifier_loss * self.opts.classifier_lambda
         loss_dict['loss'] = float(loss)
         return loss, loss_dict, id_logs
 
@@ -437,3 +555,84 @@ class Coach:
         if fake_w.ndim == 3:
             fake_w = fake_w[:, 0, :]
         return real_w, fake_w
+
+    def face_area(self, face):
+        return (face[2] - face[0]) * (face[3] - face[1])
+
+    def predicate(self, faces):
+        l = faces.shape[0]
+        areas = np.zeros(l, dtype=np.float32)
+        for i in range(faces.shape[0]):
+            a = self.face_area(faces[i])
+            areas[i] = a
+        return areas
+
+    def segment_face(self, frame):
+        frame = cv2.resize(frame, dsize=(256, 256), interpolation=cv2.INTER_LANCZOS4)
+        faces = self.face_detector(frame, rgb=True)
+        if len(faces) > 1:
+            items = self.predicate(faces)
+            order = np.argsort(items)
+            order = np.flip(order, axis=0)
+            faces = faces[order]
+            faces = faces[0].reshape((1, 15))
+
+        if len(faces) == 0:
+            print('no faces found, not masking anything')
+            #np.save('frame_with_issue', frame)           
+            frame_copy = np.ones_like(frame)
+            return frame_copy
+
+
+        # Parse faces
+        masks = self.face_parser.predict_img(frame, faces, rgb=True).astype(np.uint8)
+        frame_copy = np.ones_like(frame)
+        i1 = (masks[0, :, :] == 4)
+        i2 = (masks[0, :, :] == 5)
+        ind = (i1 | i2)  # left or right eye
+        #ind2 = (masks[0, :, :] != 4 & masks[0, :, :] != 5)  # not any of the eyes
+        frame_copy[:, :, 0][ind] = 0
+        frame_copy[:, :, 1][ind] = 0
+        frame_copy[:, :, 2][ind] = 0
+        # frame_copy[:, :, 0][ind2] = 255
+        # frame_copy[:, :, 1][ind2] = 255
+        # frame_copy[:, :, 2][ind2] = 255
+
+        # frame_thresh = 255 * np.ones((256, 256), dtype=np.uint8)
+        # frame_thresh[ind] = 0
+        #
+        # thresh = cv2.threshold(frame_thresh, 0, 255,
+        #                        cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+        # numLabels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, 4, cv2.CV_32S)
+        # cc_areas = [stats[x, cv2.CC_STAT_AREA] for x in range(1, numLabels)]
+        # largest_label_by_area = np.argmax(np.array(cc_areas)) + 1
+        # ind3 = (labels == largest_label_by_area)
+        # ind4 = (labels != largest_label_by_area)
+        # frame_copy = np.copy(frame)
+        # frame_copy[:, :, 0][ind] = 0
+        # frame_copy[:, :, 1][ind] = 0
+        # frame_copy[:, :, 2][ind] = 0
+        # frame_copy[:, :, 0][ind4] = 0
+        # frame_copy[:, :, 1][ind4] = 0
+        # frame_copy[:, :, 2][ind4] = 0
+        return frame_copy
+
+
+
+    def mask_eyes(self, input_tensor):
+        # input tensor is (b, c, h, w)
+        #print("masking eyes")
+        #torch.save(input_tensor, 'input_tensor.pt')
+        torch_mask = torch.ones_like(input_tensor)
+        for i in range(input_tensor.shape[0]):
+            image_tensor = input_tensor[i]
+            input_np_array = image_tensor.cpu().detach().numpy()
+            input_np_array = (input_np_array + 1) * 127.5
+            input_np_array = input_np_array.astype(np.uint8)
+            input_np_array = input_np_array.transpose([1, 2, 0])
+            #np.save(f'input_np_array_{i}', input_np_array)
+            mask = self.segment_face(input_np_array).transpose([2, 0, 1])
+            torch_mask[i] *= torch.from_numpy(mask).cuda()
+        #torch.save(torch_mask, "/home/yakovdan/win/exp_16/torch_mask.pt")
+        masked_tensor = input_tensor * torch_mask
+        return masked_tensor
